@@ -176,6 +176,122 @@ default_cfgs = {
     ),
 }
 
+class MyAgentAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.,
+                 agent_num=49, window=14, **kwargs):
+        super().__init__()
+        # dim应该是论文的C
+        self.dim = dim
+        self.num_heads = num_heads
+        # head_dim查询大小
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5 # 这里表示 1/sqrt(head_dim)
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.softmax = nn.Softmax(dim=-1)
+
+        # agent_num是论文的n
+        self.agent_num = agent_num
+        # window就是特征图的H,W。
+        self.window = window
+
+        self.dwc = nn.Conv2d(in_channels=dim, out_channels=dim, kernel_size=(3, 3),
+                             padding=1, groups=dim)
+        # an_bias大小应该是
+        # 这里的7可能就是论文里面提到的ho,wo超参数，说明an_bias可能是B1b
+        self.an_bias = nn.Parameter(torch.zeros(num_heads, agent_num, 7, 7))
+        self.ah_bias = nn.Parameter(torch.zeros(1, num_heads, agent_num, window, 1)) # ah_bias可能是B1r
+        self.aw_bias = nn.Parameter(torch.zeros(1, num_heads, agent_num, 1, window)) # aw_bias可能是B1c
+        self.ac_bias = nn.Parameter(torch.zeros(1, num_heads, agent_num, 1))
+        
+        self.na_bias = nn.Parameter(torch.zeros(num_heads, agent_num, 7, 7))
+        self.ha_bias = nn.Parameter(torch.zeros(1, num_heads, window, 1, agent_num))
+        self.wa_bias = nn.Parameter(torch.zeros(1, num_heads, 1, window, agent_num))
+        self.ca_bias = nn.Parameter(torch.zeros(1, num_heads, 1, agent_num))
+        trunc_normal_(self.an_bias, std=.02)
+        trunc_normal_(self.na_bias, std=.02)
+        trunc_normal_(self.ah_bias, std=.02)
+        trunc_normal_(self.aw_bias, std=.02)
+        trunc_normal_(self.ha_bias, std=.02)
+        trunc_normal_(self.wa_bias, std=.02)
+        trunc_normal_(self.ac_bias, std=.02)
+        trunc_normal_(self.ca_bias, std=.02)
+        pool_size = int(agent_num ** 0.5) # 这里表示 sqrt(agent_num)
+        self.pool = nn.AdaptiveAvgPool2d(output_size=(pool_size, pool_size))
+
+    def forward(self, x):
+        """
+        Args:
+            x: input features with shape of (num_windows*B, N, C)
+            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+        """
+        # 这里的c=dim,
+        b, N, c = x.shape
+        h = int(N ** 0.5) # 这里表示 int(sqrt(N))
+        w = int(N ** 0.5) # 这里表示 int(sqrt(N))
+        num_heads = self.num_heads
+        head_dim = c // num_heads
+        # qkv:(b, N, c) -> (b, N, c*3) -> (b, N, 3, c) -> (3, b, N, c)
+        qkv = self.qkv(x).reshape(b, N, 3, c).permute(2, 0, 1, 3)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+        # q, k, v: (b, N, c)
+
+        # pool的参数是：(b, N-1, c) -> (b, h, w, c) -> (b, c, h, w). ps:这里减1是为了reshape，不然要报错
+        # agent_tokens: (b, c, h, w) -> (b, c, int(sqrt(n)), int(sqrt(n))) -> (b, c, n) -> (b, n, c)
+        agent_tokens = self.pool(q[:, 1:, :].reshape(b, h, w, c).permute(0, 3, 1, 2)).reshape(b, c, -1).permute(0, 2, 1)
+        # q, k, v: (b, num_heads, N, head_dim)
+        q = q.reshape(b, N, num_heads, head_dim).permute(0, 2, 1, 3) 
+        k = k.reshape(b, N, num_heads, head_dim).permute(0, 2, 1, 3)
+        v = v.reshape(b, N, num_heads, head_dim).permute(0, 2, 1, 3)
+        # agent_tokens: (b, n, c) -> (b, n, num_heads, head_dim) -> (b, num_heads, n, head_dim)
+        agent_tokens = agent_tokens.reshape(b, self.agent_num, num_heads, head_dim).permute(0, 2, 1, 3)
+
+        # B1
+        # 这里的an_bias也就是论文提到的，B1b from (num_heads,n,h0,w0) to (num_heads,n,h,w)
+        position_bias1 = nn.functional.interpolate(self.an_bias, size=(self.window, self.window), mode='bilinear')
+        # B1b size: (num_heads, n, h, w) -> (1, num_heads, n, h*w) -> (b, num_heads, n, h*w)
+        position_bias1 = position_bias1.reshape(1, num_heads, self.agent_num, -1).repeat(b, 1, 1, 1)
+        # B1r+B1c size: (1, num_heads, n, h, w) -> (1, num_heads, n, h*w) -> (b, num_heads, n, h*w)
+        position_bias2 = (self.ah_bias + self.aw_bias).reshape(1, num_heads, self.agent_num, -1).repeat(b, 1, 1, 1)
+        # 最终B1 = B1b + B1r +B1c : (b, num_heads, n, h*w)
+        position_bias = position_bias1 + position_bias2
+        # ac_bias size: (1, num_heads, n, 1) -> (b, num_heads, n, 1)
+        # B1 size: (b, num_heads, n, h*w) -> (b, num_heads, n, h*w+1). ps:这里加1是因为由于上面reshape减了1。以免后面矩阵相加报错
+        position_bias = torch.cat([self.ac_bias.repeat(b, 1, 1, 1), position_bias], dim=-1)
+        
+        #  A @ K + B1: (b, num_heads, n, head_dim) @ (b, num_heads, head_dim, N) + (b, num_heads, n, h*w+1)
+        agent_attn = self.softmax((agent_tokens * self.scale) @ k.transpose(-2, -1) + position_bias)
+        # agent_atten: (b, num_heads, n, N)
+        agent_attn = self.attn_drop(agent_attn)
+        # agent_atten @ v: (b, num_heads, n, N) @ (b, num_heads, N, head_dim) -> (b, num_heads, n, head_dim)
+        agent_v = agent_attn @ v
+
+        # B2
+         # 这里的na_bias，B2b from (num_heads,n,h0,w0) to (num_heads,n,h,w)
+        agent_bias1 = nn.functional.interpolate(self.na_bias, size=(self.window, self.window), mode='bilinear')
+        # B2b size: (num_heads, n, h, w) -> (1, num_heads, n, h*w) -> (1, num_heads, h*w, n) -> (b, num_heads, h*w, n)
+        agent_bias1 = agent_bias1.reshape(1, num_heads, self.agent_num, -1).permute(0, 1, 3, 2).repeat(b, 1, 1, 1)
+        # B2r+B2c size: (1, num_heads, h, w, n) -> (1, num_heads, h*w, n) -> (b, num_heads, h*w, n)
+        agent_bias2 = (self.ha_bias + self.wa_bias).reshape(1, num_heads, -1, self.agent_num).repeat(b, 1, 1, 1)
+        # 最终B2 = B2b + B2r +B2c : (b, num_heads, h*w, n)
+        agent_bias = agent_bias1 + agent_bias2
+        # ca_bias size: (1, num_heads, 1, n) -> (b, num_heads, 1, n)
+        # B2 size: (b, num_heads, h*w, n) -> (b, num_heads, h*w+1, n)
+        agent_bias = torch.cat([self.ca_bias.repeat(b, 1, 1, 1), agent_bias], dim=-2)
+        q_attn = self.softmax((q * self.scale) @ agent_tokens.transpose(-2, -1) + agent_bias)
+        q_attn = self.attn_drop(q_attn)
+        x = q_attn @ agent_v
+
+        x = x.transpose(1, 2).reshape(b, N, c)
+        v_ = v[:, :, 1:, :].transpose(1, 2).reshape(b, h, w, c).permute(0, 3, 1, 2)
+        x[:, 1:, :] = x[:, 1:, :] + self.dwc(v_).permute(0, 2, 3, 1).reshape(b, N - 1, c)
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
 
 class AgentAttention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.,
