@@ -176,7 +176,7 @@ default_cfgs = {
     ),
 }
 
-class MyAgentAttention(nn.Module):
+class AgentAttention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.,
                  agent_num=49, window=14, **kwargs):
         super().__init__()
@@ -280,12 +280,20 @@ class MyAgentAttention(nn.Module):
         # ca_bias size: (1, num_heads, 1, n) -> (b, num_heads, 1, n)
         # B2 size: (b, num_heads, h*w, n) -> (b, num_heads, h*w+1, n)
         agent_bias = torch.cat([self.ca_bias.repeat(b, 1, 1, 1), agent_bias], dim=-2)
+        # q_attn = Softmax(Q @ A + B2) : Softmax((b, num_heads, N, head_dim) @ (b, num_heads, head_dim, n) + (b, num_heads, h*w+1, n))
         q_attn = self.softmax((q * self.scale) @ agent_tokens.transpose(-2, -1) + agent_bias)
+        # q_attn : (b, num_heads, N, n)
         q_attn = self.attn_drop(q_attn)
+        # x : (b, num_heads, N, n) @ b, num_heads, n, head_dim) -> (b, num_heads, N, head_dim)
         x = q_attn @ agent_v
 
+        # x : (b, num_heads, N, head_dim) -> (b, N, num_heads, head_dim) -> (b, N, c)
         x = x.transpose(1, 2).reshape(b, N, c)
+        # v_ : (b, num_heads, N, head_dim) -> (b, num_heads, N-1, head_dim) -> (b, N, num_heads, head_dim)
+        # -> (b, h, w, c) -> (b, c, h, w)
         v_ = v[:, :, 1:, :].transpose(1, 2).reshape(b, h, w, c).permute(0, 3, 1, 2)
+        # self.dwc(v_) -> (b, c, h, w) -> (b, h, w, c) -> (b, N - 1, c)
+        # x[:, 1:, :] : (b, N-1, c) + (b, N - 1, c)
         x[:, 1:, :] = x[:, 1:, :] + self.dwc(v_).permute(0, 2, 3, 1).reshape(b, N - 1, c)
 
         x = self.proj(x)
